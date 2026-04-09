@@ -9,11 +9,14 @@ Estrutura esperada na planilha (cada aba é uma "tabela"):
   - Aba "escalas"      : gerada automaticamente pelo app ao salvar
 
 Uso:
-  from sheets_integration import SheetsClient
-  client = SheetsClient(credentials_path="credentials.json",
-                        spreadsheet_name="Escala de Louvor")
+  from sheets_integration import get_sheets_client
+  client = get_sheets_client()
   df = client.ler_integrantes()
   client.salvar_escala(df_resultado, avisos)
+
+Credenciais (em ordem de prioridade):
+  1. st.secrets["gcp_service_account"]  →  Streamlit Cloud ou .streamlit/secrets.toml local
+  2. arquivo credentials.json na raiz   →  fallback para desenvolvimento sem secrets
 """
 
 import json
@@ -42,43 +45,61 @@ CABECALHO_ESCALAS = [
     "integrante", "funcao", "nivel",
 ]
 CABECALHO_AVISOS = ["gerado_em", "data_culto", "aviso"]
+CABECALHO_DISPONIBILIDADE = ["nome", "data", "periodo", "atualizado_em"]
+
+
+def _carregar_credenciais() -> Credentials:
+    """
+    Carrega credenciais em ordem de prioridade:
+      1. st.secrets["gcp_service_account"] (Streamlit Cloud ou secrets.toml local)
+      2. arquivo credentials.json na raiz do projeto (fallback de desenvolvimento)
+
+    Levanta RuntimeError com mensagem clara se nenhuma fonte for encontrada.
+    """
+    # — Prioridade 1: st.secrets ————————————————————————————————————
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    except (KeyError, FileNotFoundError):
+        pass  # secrets não configurado, tenta o fallback
+
+    # — Prioridade 2: credentials.json local ————————————————————————
+    local_path = Path("credentials.json")
+    if local_path.exists():
+        return Credentials.from_service_account_file(str(local_path), scopes=SCOPES)
+
+    # — Nenhuma fonte encontrada ————————————————————————————————————
+    raise RuntimeError(
+        "Credenciais do Google não encontradas.\n\n"
+        "Para rodar localmente: crie .streamlit/secrets.toml com a seção "
+        "[gcp_service_account], ou coloque credentials.json na raiz do projeto.\n"
+        "Para Streamlit Cloud: configure os secrets em Settings → Secrets."
+    )
+
+
+@st.cache_resource(show_spinner="Conectando ao Google Sheets...")
+def get_sheets_client(spreadsheet_name: str = "Escala de Louvor") -> "SheetsClient":
+    """
+    Retorna uma instância cacheada de SheetsClient.
+    O cache é mantido enquanto o app estiver rodando;
+    chame st.cache_resource.clear() para forçar reconexão.
+
+    Uso no app:
+        client = get_sheets_client()
+    """
+    return SheetsClient(spreadsheet_name=spreadsheet_name)
 
 
 class SheetsClient:
     """
     Encapsula todas as operações de leitura e escrita no Google Sheets.
     Cria abas automaticamente se não existirem.
+    Obtém credenciais via _carregar_credenciais() — nunca recebe
+    caminhos ou dicionários diretamente.
     """
 
-    def __init__(
-        self,
-        credentials_path: str | None = None,
-        credentials_dict: dict | None = None,
-        spreadsheet_name: str = "Escala de Louvor",
-    ):
-        """
-        Aceita credenciais como caminho de arquivo (desenvolvimento local)
-        ou como dicionário (secrets do Streamlit Cloud).
-
-        Parameters
-        ----------
-        credentials_path  : caminho para o arquivo credentials.json local
-        credentials_dict  : dicionário com o conteúdo do JSON (para deploy)
-        spreadsheet_name  : nome exato da planilha no Google Drive
-        """
-        if credentials_dict:
-            creds = Credentials.from_service_account_info(
-                credentials_dict, scopes=SCOPES
-            )
-        elif credentials_path:
-            creds = Credentials.from_service_account_file(
-                credentials_path, scopes=SCOPES
-            )
-        else:
-            raise ValueError(
-                "Forneça credentials_path (local) ou credentials_dict (deploy)."
-            )
-
+    def __init__(self, spreadsheet_name: str = "Escala de Louvor"):
+        creds = _carregar_credenciais()
         self._gc = gspread.authorize(creds)
         self._sh = self._gc.open(spreadsheet_name)
 
@@ -209,47 +230,103 @@ class SheetsClient:
             ws.clear()
             ws.append_row(cab, value_input_option="USER_ENTERED")
 
+    # ── Disponibilidade ───────────────────────────────────────────
+
+    def ler_disponibilidade(self) -> pd.DataFrame:
+        """
+        Lê a aba 'disponibilidade' e retorna um DataFrame.
+        Colunas: nome, data, periodo, atualizado_em
+        """
+        ws = self._aba("disponibilidade", CABECALHO_DISPONIBILIDADE)
+        df = self._ws_para_df(ws)
+        if df.empty:
+            return pd.DataFrame(columns=CABECALHO_DISPONIBILIDADE)
+        df["data"] = pd.to_datetime(df["data"], errors="coerce").dt.date
+        return df
+
+    def salvar_disponibilidade(
+        self,
+        nome: str,
+        datas: list,
+        periodo: str = "manha",
+    ) -> dict:
+        """
+        Salva ou atualiza a disponibilidade de um integrante.
+
+        Para cada (nome, data):
+          - Se já existir uma linha → atualiza periodo e atualizado_em.
+          - Se não existir          → insere linha nova.
+
+        Retorna {"inseridos": int, "atualizados": int}.
+        """
+        ws = self._aba("disponibilidade", CABECALHO_DISPONIBILIDADE)
+        registros = ws.get_all_records()   # lista de dicts, linha 1 = cabeçalho
+        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M")
+
+        # Índice {(nome, data_str): numero_linha_na_planilha}
+        # get_all_records retorna a partir da linha 2 (linha 1 = cabeçalho)
+        indice: dict[tuple, int] = {}
+        for i, reg in enumerate(registros, start=2):
+            chave = (str(reg.get("nome", "")), str(reg.get("data", "")))
+            indice[chave] = i
+
+        inseridos = 0
+        atualizados = 0
+        novas_linhas = []
+
+        for dt in datas:
+            data_str = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+            chave = (nome, data_str)
+
+            if chave in indice:
+                # Atualiza a linha existente (apenas periodo e timestamp)
+                num_linha = indice[chave]
+                # Colunas: A=nome B=data C=periodo D=atualizado_em
+                ws.update(
+                    f"C{num_linha}:D{num_linha}",
+                    [[periodo, timestamp]],
+                    value_input_option="USER_ENTERED",
+                )
+                atualizados += 1
+            else:
+                novas_linhas.append([nome, data_str, periodo, timestamp])
+                inseridos += 1
+
+        if novas_linhas:
+            ws.append_rows(novas_linhas, value_input_option="USER_ENTERED")
+
+        return {"inseridos": inseridos, "atualizados": atualizados}
+
 
 # ════════════════════════════════════════════════════════════════════
-# COMO CONECTAR NO APP STREAMLIT (cole no app_escala_louvor.py)
+# COMO USAR NO app_escala_louvor.py
 # ════════════════════════════════════════════════════════════════════
 #
-# ── Opção A: desenvolvimento local ──────────────────────────────────
+# ── Importar e conectar (uma linha) ─────────────────────────────────
 #
-#   @st.cache_resource
-#   def get_sheets_client():
-#       return SheetsClient(
-#           credentials_path="credentials.json",
-#           spreadsheet_name="Escala de Louvor",
-#       )
-#
-#   client = get_sheets_client()
+#   from sheets_integration import get_sheets_client
+#   client = get_sheets_client()          # cache automático, sem parâmetros
 #   df_input = client.ler_integrantes()
 #
 #
-# ── Opção B: Streamlit Cloud (usando st.secrets) ─────────────────────
+# ── Configurar credenciais ───────────────────────────────────────────
 #
-#   No Streamlit Cloud, vá em Settings → Secrets e cole:
+#   LOCAL → crie .streamlit/secrets.toml:
 #
-#   [gcp_service_account]
-#   type = "service_account"
-#   project_id = "seu-projeto"
-#   private_key_id = "..."
-#   private_key = "-----BEGIN RSA PRIVATE KEY-----\n..."
-#   client_email = "escala-bot@seu-projeto.iam.gserviceaccount.com"
-#   client_id = "..."
-#   auth_uri = "https://accounts.google.com/o/oauth2/auth"
-#   token_uri = "https://oauth2.googleapis.com/token"
+#     [gcp_service_account]
+#     type = "service_account"
+#     project_id = "seu-projeto"
+#     private_key_id = "..."
+#     private_key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+#     client_email = "escala-bot@seu-projeto.iam.gserviceaccount.com"
+#     client_id = "..."
+#     auth_uri = "https://accounts.google.com/o/oauth2/auth"
+#     token_uri = "https://oauth2.googleapis.com/token"
 #
-#   Depois no código:
+#   STREAMLIT CLOUD → cole o mesmo conteúdo em Settings → Secrets.
 #
-#   @st.cache_resource
-#   def get_sheets_client():
-#       creds_dict = dict(st.secrets["gcp_service_account"])
-#       return SheetsClient(
-#           credentials_dict=creds_dict,
-#           spreadsheet_name="Escala de Louvor",
-#       )
+#   FALLBACK → coloque credentials.json na raiz do projeto
+#              (útil para testes rápidos, nunca suba para o GitHub).
 #
 #
 # ── Salvar escala após gerar ─────────────────────────────────────────
@@ -261,6 +338,7 @@ class SheetsClient:
 #       ]
 #       client.salvar_escala(df_resultado, avisos_flat, substituir=True)
 #       st.success("Escala salva na planilha!")
+#
 #
 # ── Adicionar integrante via formulário ──────────────────────────────
 #
