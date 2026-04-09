@@ -601,4 +601,3 @@ if pagina == "📊 Escala":
 elif pagina == "📅 Disponibilidade":
     # Delega todo o rendering para o módulo dedicado
     render_cadastro_disponibilidade(client)
-    )
