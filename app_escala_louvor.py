@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
 import io
+from sheets_integration import get_sheets_client
+from cadastro_disponibilidade import render_cadastro_disponibilidade
 
+client = get_sheets_client()
 
 # ═══════════════════════════════════════════════════════════════════
 # MODELOS DE DADOS
@@ -502,221 +505,100 @@ st.markdown("""
 
 # ── Sidebar: configurações ────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### ⚙️ Configurações")
-
-    tipo_culto = st.selectbox(
-        "Tipo de culto",
-        ["culto", "ensaio", "evento"],
-        format_func=lambda x: x.capitalize(),
-    )
-
-    periodo = st.selectbox(
-        "Período",
-        ["manha", "tarde", "noite", "dia_todo"],
-        format_func=lambda x: {
-            "manha": "Manhã", "tarde": "Tarde",
-            "noite": "Noite", "dia_todo": "Dia todo",
-        }[x],
-    )
-
-    st.markdown("---")
-    st.markdown("### 📅 Datas")
-
-    data_inicio = st.date_input("Data inicial", value=date(2025, 5, 4))
-    num_semanas = st.slider("Nº de domingos", 1, 8, 4)
-
-    datas = [data_inicio + timedelta(weeks=i) for i in range(num_semanas)]
-
-    st.markdown("**Datas selecionadas:**")
-    for d in datas:
-        st.markdown(f"- {d.strftime('%d/%m/%Y')} ({d.strftime('%A')})")
-
-    st.markdown("---")
-    st.markdown("### 📥 CSV de exemplo")
-    st.download_button(
-        label="Baixar modelo CSV",
-        data=csv_exemplo(),
-        file_name="modelo_integrantes.csv",
-        mime="text/csv",
-    )
-
-
-# ── Upload CSV ────────────────────────────────────────────────────
-st.markdown("### 1. Carregue a lista de integrantes")
-
-col_upload, col_hint = st.columns([2, 1])
-with col_upload:
-    arquivo = st.file_uploader(
-        "Arquivo CSV com colunas: nome, instrumento, nivel_tecnico, datas_disponiveis, ativo",
-        type=["csv"],
+    st.markdown("### 🎵 Menu")
+    pagina = st.radio(
+        label="Navegação",
+        options=["📊 Escala", "📅 Disponibilidade"],
         label_visibility="collapsed",
     )
 
-with col_hint:
-    st.info(
-        "**Formato esperado:**\n"
-        "- `datas_disponiveis`: datas no formato `AAAA-MM-DD` separadas por `;`\n"
-        "- Um integrante pode aparecer em **várias linhas** (um instrumento por linha)\n"
-        "- Baixe o modelo CSV na barra lateral"
-    )
-
-# Usa dados de exemplo se nenhum arquivo for carregado
-usar_exemplo = st.checkbox("Usar dados de exemplo", value=True)
-
-df_input = None
-if arquivo:
-    df_input = pd.read_csv(arquivo)
-    st.success(f"✅ {len(df_input)} registros carregados.")
-    with st.expander("Ver dados carregados"):
-        st.dataframe(df_input, use_container_width=True)
-elif usar_exemplo:
-    df_input = pd.read_csv(io.StringIO(csv_exemplo()))
-    st.caption("ℹ️ Usando dados de exemplo — carregue seu próprio CSV acima para substituir.")
-
-
-# ── Botão principal ───────────────────────────────────────────────
-st.markdown("### 2. Gere a escala")
-
-gerar = st.button("🎵 Gerar Escala", type="primary", disabled=(df_input is None))
-
-if gerar and df_input is not None:
-    with st.spinner("Calculando a melhor escala..."):
-        db = criar_banco_de_csv(df_input)
-        gerador = GeradorEscala(db)
-        escalas = gerador.gerar_escala_semanal(datas, tipo=tipo_culto, periodo=periodo)
-        df_resultado = escalas_para_dataframe(escalas, db)
-
-    # ── Stats ──────────────────────────────────────────────────────
     st.markdown("---")
-    st.markdown("### 3. Resultado")
 
-    total_membros_escalados = df_resultado["Integrante"].nunique() if not df_resultado.empty else 0
-    total_avisos = sum(len(e.avisos) for e in escalas)
-    lideres_count = len(df_resultado[df_resultado["Função"] == "Lider"]) if not df_resultado.empty else 0
+    # Configurações só aparecem na página de Escala
+    if pagina == "📊 Escala":
+        st.markdown("### ⚙️ Configurações")
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f"""<div class="stat-card">
-            <div class="stat-number">{len(escalas)}</div>
-            <div class="stat-label">Cultos escalados</div>
-        </div>""", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"""<div class="stat-card">
-            <div class="stat-number">{total_membros_escalados}</div>
-            <div class="stat-label">Integrantes únicos</div>
-        </div>""", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"""<div class="stat-card">
-            <div class="stat-number">{lideres_count}</div>
-            <div class="stat-label">Posições de líder</div>
-        </div>""", unsafe_allow_html=True)
-    with c4:
-        cor = "#e8533a" if total_avisos > 0 else "#2a9d5c"
-        st.markdown(f"""<div class="stat-card">
-            <div class="stat-number" style="color:{cor}">{total_avisos}</div>
-            <div class="stat-label">Avisos</div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    # ── Tabela por data ────────────────────────────────────────────
-    if not df_resultado.empty:
-        for escala in escalas:
-            data_str = escala.data.strftime("%d/%m/%Y")
-            df_data = df_resultado[df_resultado["Data"] == data_str]
-
-            with st.expander(f"📅 {escala.titulo}", expanded=True):
-                if df_data.empty:
-                    st.warning("Nenhum integrante pôde ser escalado para esta data.")
-                else:
-                    # Constrói HTML da tabela
-                    rows_html = ""
-                    for _, row in df_data.iterrows():
-                        nivel = row["Nível"]
-                        if isinstance(nivel, (int, float)):
-                            dots_cheios = int(nivel)
-                            dots_html = "".join(
-                                [f'<span class="nivel-dot" style="background:#0f3460"></span>'] * dots_cheios +
-                                [f'<span class="nivel-dot" style="background:#ddd"></span>'] * (5 - dots_cheios)
-                            )
-                        else:
-                            dots_html = "–"
-
-                        funcao_badge = (
-                            f'<span class="badge-lider">⭐ Líder</span>'
-                            if row["Função"] == "Lider"
-                            else f'<span class="badge-musico">Músico</span>'
-                        )
-
-                        rows_html += f"""
-                        <tr>
-                            <td><strong>{row['Instrumento']}</strong></td>
-                            <td>{row['Integrante']}</td>
-                            <td>{funcao_badge}</td>
-                            <td>{dots_html}</td>
-                        </tr>"""
-
-                    st.markdown(f"""
-                    <table class="escala-table">
-                        <thead>
-                            <tr>
-                                <th>Instrumento</th>
-                                <th>Integrante</th>
-                                <th>Função</th>
-                                <th>Nível técnico</th>
-                            </tr>
-                        </thead>
-                        <tbody>{rows_html}</tbody>
-                    </table>
-                    """, unsafe_allow_html=True)
-
-                # Avisos desta data
-                if escala.avisos:
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    for aviso in escala.avisos:
-                        st.markdown(
-                            f'<div class="aviso-box">⚠️ {aviso}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-    # ── Exportar ───────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 4. Exportar")
-
-    col_csv, col_excel = st.columns(2)
-
-    with col_csv:
-        csv_out = df_resultado.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Baixar como CSV",
-            data=csv_out,
-            file_name="escala_louvor.csv",
-            mime="text/csv",
-            use_container_width=True,
+        tipo_culto = st.selectbox(
+            "Tipo de culto",
+            ["culto", "ensaio", "evento"],
+            format_func=lambda x: x.capitalize(),
+        )
+        periodo = st.selectbox(
+            "Período",
+            ["manha", "tarde", "noite", "dia_todo"],
+            format_func=lambda x: {
+                "manha": "Manhã", "tarde": "Tarde",
+                "noite": "Noite", "dia_todo": "Dia todo",
+            }[x],
         )
 
-    with col_excel:
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df_resultado.to_excel(writer, index=False, sheet_name="Escala")
-            # Aba de avisos
-            avisos_rows = [
-                {"Data": e.data.strftime("%d/%m/%Y"), "Aviso": a}
+        st.markdown("---")
+        st.markdown("### 📅 Datas")
+        data_inicio = st.date_input("Data inicial", value=date(2025, 5, 4))
+        num_semanas = st.slider("Nº de domingos", 1, 8, 4)
+        datas = [data_inicio + timedelta(weeks=i) for i in range(num_semanas)]
+
+        st.markdown("**Datas selecionadas:**")
+        for d in datas:
+            st.markdown(f"- {d.strftime('%d/%m/%Y')}")
+
+        st.markdown("---")
+        st.markdown("### 📥 CSV de exemplo")
+        st.download_button(
+            label="Baixar modelo CSV",
+            data=csv_exemplo(),          # função já existente no seu app
+            file_name="modelo_integrantes.csv",
+            mime="text/csv",
+        )
+
+st.markdown("""
+<div class="hero">
+  <h1>🎵 Escala de Louvor</h1>
+  <p>Geração automática de escalas com base em disponibilidade,
+     nível técnico e rodízio de integrantes.</p>
+</div>
+""", unsafe_allow_html=True)
+
+# ── Roteamento ────────────────────────────────────────────────────
+if pagina == "📊 Escala":
+
+    # ── Carrega integrantes do Sheets (ou CSV de exemplo) ──────────
+    df_integrantes = client.ler_integrantes()
+
+    # Mantém o fallback para dados de exemplo se a planilha estiver vazia
+    usar_exemplo = st.checkbox("Usar dados de exemplo", value=df_integrantes.empty)
+    if usar_exemplo or df_integrantes.empty:
+        import io
+        df_input = pd.read_csv(io.StringIO(csv_exemplo()))
+        st.caption("ℹ️ Usando dados de exemplo.")
+    else:
+        df_input = df_integrantes
+        st.caption(f"✅ {len(df_input)} registros carregados do Google Sheets.")
+
+    # ── Botão Gerar Escala (igual ao original) ────────────────────
+    gerar = st.button("🎵 Gerar Escala", type="primary")
+
+    if gerar:
+        with st.spinner("Calculando a melhor escala..."):
+            db = criar_banco_de_csv(df_input)           # função já existente
+            gerador = GeradorEscala(db)                 # classe já existente
+            escalas = gerador.gerar_escala_semanal(
+                datas, tipo=tipo_culto, periodo=periodo
+            )
+            df_resultado = escalas_para_dataframe(escalas, db)  # função já existente
+
+        # … (todo o bloco de exibição de resultados que você já tem) …
+
+        # ── Botão de persistência no Sheets ───────────────────────
+        if st.button("💾 Salvar escala no Google Sheets"):
+            avisos_flat = [
+                {"data_culto": e.data.strftime("%d/%m/%Y"), "aviso": a}
                 for e in escalas for a in e.avisos
             ]
-            if avisos_rows:
-                pd.DataFrame(avisos_rows).to_excel(writer, index=False, sheet_name="Avisos")
-        st.download_button(
-            "⬇️ Baixar como Excel",
-            data=buffer.getvalue(),
-            file_name="escala_louvor.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+            client.salvar_escala(df_resultado, avisos_flat, substituir=True)
+            st.success("Escala salva na planilha!")
 
-elif not gerar and df_input is not None:
-    st.markdown(
-        '<p style="color:#888; font-style:italic; margin-top:.5rem;">'
-        'Clique em <strong>Gerar Escala</strong> para ver o resultado.</p>',
-        unsafe_allow_html=True,
+elif pagina == "📅 Disponibilidade":
+    # Delega todo o rendering para o módulo dedicado
+    render_cadastro_disponibilidade(client)
     )
